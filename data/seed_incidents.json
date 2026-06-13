@@ -1,0 +1,8 @@
+[
+  {"id": "inc_001", "category": "database", "text": "payment-service DB connection timeout. Cause: PgBouncer pool exhausted (20/20). Fix: restarted PgBouncer pool, resolved in 8 min. Root cause was a batch job leaking connections."},
+  {"id": "inc_002", "category": "database", "text": "order-service slow queries during peak hours. Cause: missing index on orders.created_at. Fix: added composite index, query time dropped from 4s to 80ms."},
+  {"id": "inc_003", "category": "network", "text": "auth-service DNS resolution failures. Cause: Route53 health check misconfigured, marked healthy targets as unhealthy. Fix: corrected health check path from /health to /healthz."},
+  {"id": "inc_004", "category": "network", "text": "Intermittent 503s from api-gateway to user-service. Cause: connection pool to upstream too small under load. Fix: increased keepalive connections from 10 to 50."},
+  {"id": "inc_005", "category": "application", "text": "order-service OOM crash during batch job. Cause: large result set loaded fully into memory instead of streaming. Fix: switched to cursor-based pagination, memory usage dropped 90%."},
+  {"id": "inc_006", "category": "application", "text": "notification-service CrashLoopBackOff after deploy. Cause: missing environment variable for SMTP config introduced in new release. Fix: added env var to deployment manifest, rolled forward."}
+]

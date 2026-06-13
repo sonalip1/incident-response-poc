@@ -1,0 +1,32 @@
+# ── DB INCIDENT ─────────────────────────────────────────────────────────
+2025-05-10 02:14:31 INFO  payment-service    Connecting to postgres://db-primary:5432/payments
+2025-05-10 02:14:31 WARN  payment-service    Connection pool at 95% capacity (19/20 connections used)
+2025-05-10 02:14:33 ERROR payment-service    DB connection timeout after 30000ms
+2025-05-10 02:14:33 ERROR payment-service    Retry 1/3 failed: connection refused
+2025-05-10 02:14:39 ERROR payment-service    Retry 3/3 failed: connection refused
+2025-05-10 02:14:40 ERROR payment-service    Unhandled exception: PSQLException: too many connections
+2025-05-10 02:14:40 INFO  alertmanager       PagerDuty alert fired: payment-service-db-down SEV3
+
+# ── NETWORK INCIDENT ─────────────────────────────────────────────────────
+2025-05-10 03:41:02 INFO  api-gateway        Routing POST /api/auth/login to auth-service:8080
+2025-05-10 03:41:02 WARN  api-gateway        DNS resolution for auth-service.internal: 2800ms (threshold: 500ms)
+2025-05-10 03:41:07 ERROR api-gateway        DNS resolution failed: NXDOMAIN for auth-service.internal
+2025-05-10 03:41:07 ERROR api-gateway        Circuit breaker OPEN for auth-service after 5 consecutive failures
+2025-05-10 03:41:09 ERROR api-gateway        All auth backends unreachable. Returning 503 to client.
+2025-05-10 03:41:10 INFO  alertmanager       PagerDuty alert fired: auth-service-unreachable SEV2
+
+# ── APPLICATION INCIDENT ─────────────────────────────────────────────────
+2025-05-10 05:22:10 INFO  order-service      Processing batch job: daily-reconciliation (12,450 orders)
+2025-05-10 05:22:45 WARN  order-service      GC pause: 4200ms (Full GC triggered). Heap: 94% (7.5GB / 8GB)
+2025-05-10 05:22:46 ERROR order-service      OutOfMemoryError: Java heap space
+2025-05-10 05:22:46 ERROR order-service      Thread pool exhausted: 0/200 threads available
+2025-05-10 05:22:46 ERROR order-service      FATAL: Application crash. Exit code 137 (OOM Kill)
+2025-05-10 05:22:47 INFO  kubernetes         Pod order-service-7d8f9b-xk2p9 restarted (CrashLoopBackOff)
+2025-05-10 05:22:48 INFO  alertmanager       PagerDuty alert fired: order-service-crash-loop SEV2
+
+# ── AMBIGUOUS (tests graceful degradation later) ──────────────────────────
+2025-05-10 06:55:01 WARN  data-pipeline      Checkpoint file missing: /data/checkpoints/etl-run-20250510.ckpt
+2025-05-10 06:55:01 WARN  data-pipeline      Falling back to full reprocess (estimated 45 min delay)
+2025-05-10 06:55:03 ERROR data-pipeline      Source schema mismatch: expected 24 columns, got 27
+2025-05-10 06:55:03 ERROR data-pipeline      Pipeline halted. Manual intervention required.
+2025-05-10 06:55:04 INFO  alertmanager       PagerDuty alert fired: etl-pipeline-halted SEV4
