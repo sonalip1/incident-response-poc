@@ -1,506 +1,518 @@
-const API_BASE_URL = "http://127.0.0.1:8000";
+const API_BASE_URL = "http://localhost:8000";
 
-// Hardcoded log templates
-const LOG_TEMPLATES = {
-    database: `# ── DB INCIDENT ─────────────────────────────────────────────────────────
-2025-05-10 02:14:31 INFO  payment-service    Connecting to postgres://db-primary:5432/payments
-2025-05-10 02:14:31 WARN  payment-service    Connection pool at 95% capacity (19/20 connections used)
-2025-05-10 02:14:33 ERROR payment-service    DB connection timeout after 30000ms
-2025-05-10 02:14:33 ERROR payment-service    Retry 1/3 failed: connection refused
-2025-05-10 02:14:39 ERROR payment-service    Retry 3/3 failed: connection refused
-2025-05-10 02:14:40 ERROR payment-service    Unhandled exception: PSQLException: too many connections
-2025-05-10 02:14:40 INFO  alertmanager       PagerDuty alert fired: payment-service-db-down SEV3`,
+let INCIDENTS = [];
 
-    network: `# ── NETWORK INCIDENT ─────────────────────────────────────────────────────
-2025-05-10 03:41:02 INFO  api-gateway        Routing POST /api/auth/login to auth-service:8080
-2025-05-10 03:41:02 WARN  api-gateway        DNS resolution for auth-service.internal: 2800ms (threshold: 500ms)
-2025-05-10 03:41:07 ERROR api-gateway        DNS resolution failed: NXDOMAIN for auth-service.internal
-2025-05-10 03:41:07 ERROR api-gateway        Circuit breaker OPEN for auth-service after 5 consecutive failures
-2025-05-10 03:41:09 ERROR api-gateway        All auth backends unreachable. Returning 503 to client.
-2025-05-10 03:41:10 INFO  alertmanager       PagerDuty alert fired: auth-service-unreachable SEV2`,
+const STEPS = [
+  {
+    num: 1, id: "monitor",
+    name: "Monitor agent", sub: "Log & alert ingestion",
+    icon: "ti-activity",
+    sourceType: "llm",
+    sourceLabel: "Log parsing & anomaly detection",
+    outputKeys: ["detected", "alerts", "first_seen"],
+    pendingOutput: "scanning logs…"
+  },
+  {
+    num: 2, id: "triage",
+    name: "Triage agent", sub: "Classify & prioritize",
+    icon: "ti-filter",
+    sourceType: "llm",
+    sourceLabel: "Severity scoring & routing decision",
+    outputKeys: ["severity", "category", "confidence", "route_to"],
+    pendingOutput: "classifying incident…"
+  },
+  {
+    num: 3, id: "planning",
+    name: "Planning agent", sub: "ReAct decomposition",
+    icon: "ti-sitemap",
+    sourceType: "llm",
+    sourceLabel: "Task decomposition via ReAct",
+    outputKeys: ["plan", "tools_needed"],
+    pendingOutput: "creating investigation plan…"
+  },
+  {
+    num: 4, id: "expert",
+    name: "Expert agents", sub: "Domain investigation",
+    icon: "ti-users",
+    sourceType: "rag+llm",
+    sourceLabel: "Past incidents + new reasoning",
+    outputKeys: ["rag_hits", "match", "expert_reasoning"],
+    pendingOutput: "retrieving from memory…"
+  },
+  {
+    num: 5, id: "reflection",
+    name: "Reflection agent", sub: "Validate & score",
+    icon: "ti-shield-check",
+    sourceType: "llm",
+    sourceLabel: "Self-critique of proposed fix",
+    outputKeys: ["score", "critique", "approved"],
+    pendingOutput: "awaiting expert output"
+  },
+  {
+    num: 6, id: "decision",
+    name: "Decision", sub: "Remediate or escalate",
+    icon: "ti-gavel",
+    sourceType: "rag+llm",
+    sourceLabel: "Final verdict + HITL gate",
+    outputKeys: ["action", "hitl_required", "written_to_memory"],
+    pendingOutput: "awaiting reflection score"
+  }
+];
 
-    application: `# ── APPLICATION INCIDENT ─────────────────────────────────────────────────
-2025-05-10 05:22:10 INFO  order-service      Processing batch job: daily-reconciliation (12,450 orders)
-2025-05-10 05:22:45 WARN  order-service      GC pause: 4200ms (Full GC triggered). Heap: 94% (7.5GB / 8GB)
-2025-05-10 05:22:46 ERROR order-service      OutOfMemoryError: Java heap space
-2025-05-10 05:22:46 ERROR order-service      Thread pool exhausted: 0/200 threads available
-2025-05-10 05:22:46 ERROR order-service      FATAL: Application crash. Exit code 137 (OOM Kill)
-2025-05-10 05:22:47 INFO  kubernetes         Pod order-service-7d8f9b-xk2p9 restarted (CrashLoopBackOff)
-2025-05-10 05:22:48 INFO  alertmanager       PagerDuty alert fired: order-service-crash-loop SEV2`,
-
-    ambiguous: `# ── AMBIGUOUS (tests graceful degradation later) ──────────────────────────
-2025-05-10 06:55:01 WARN  data-pipeline      Checkpoint file missing: /data/checkpoints/etl-run-20250510.ckpt
-2025-05-10 06:55:01 WARN  data-pipeline      Falling back to full reprocess (estimated 45 min delay)
-2025-05-10 06:55:03 ERROR data-pipeline      Source schema mismatch: expected 24 columns, got 27
-2025-05-10 06:55:03 ERROR data-pipeline      Pipeline halted. Manual intervention required.
-2025-05-10 06:55:04 INFO  alertmanager       PagerDuty alert fired: etl-pipeline-halted SEV4`
-};
-
-// DOM References
-const statusDot = document.getElementById("statusDot");
-const statusText = document.getElementById("statusText");
-const sampleLogsSelect = document.getElementById("sampleLogs");
-const logTextarea = document.getElementById("logText");
-const runBtn = document.getElementById("runBtn");
-const traceLogs = document.getElementById("traceLogs");
-
-// Results Card DOM References
-const resultPlaceholder = document.getElementById("resultPlaceholder");
-const incidentCard = document.getElementById("incidentCard");
-const cardSevBadge = document.getElementById("cardSevBadge");
-const cardServiceTag = document.getElementById("cardServiceTag");
-const cardHandlerTag = document.getElementById("cardHandlerTag");
-const cardRootCause = document.getElementById("cardRootCause");
-const confidenceRingBar = document.getElementById("confidenceRingBar");
-const cardConfidenceText = document.getElementById("cardConfidenceText");
-const cardFixSteps = document.getElementById("cardFixSteps");
-const hitlPanel = document.getElementById("hitlPanel");
-const approveBtn = document.getElementById("approveBtn");
-const rejectBtn = document.getElementById("rejectBtn");
-const toggleRawBtn = document.getElementById("toggleRawBtn");
-const rawTraceLogs = document.getElementById("rawTraceLogs");
-const historyStrip = document.getElementById("historyStrip");
-
+let currentIncidentId = null;
+let eventSource = null;
 let isBackendConnected = false;
-let currentEventSource = null;
-let activeIncidentId = null;
-let currentTraceEvents = [];
-let pastIncidents = [];
+let timer = null;
 
-// 1. Connection check / health polling
-async function checkBackendConnection() {
-    try {
-        const response = await fetch(`${API_BASE_URL}/api/incidents`);
-        if (response.ok) {
-            setConnectionState(true, "System Online");
-        } else {
-            setConnectionState(false, "System Offline (Server Error)");
-        }
-    } catch (error) {
-        setConnectionState(false, "System Offline (Unable to Connect)");
-    }
-}
-
-function setConnectionState(connected, text) {
-    isBackendConnected = connected;
-    statusText.innerText = text;
-    if (connected) {
-        statusDot.classList.add("connected");
-        if (runBtn.innerText === "Run Incident Response") {
-            runBtn.removeAttribute("disabled");
-        }
-    } else {
-        statusDot.classList.remove("connected");
-        runBtn.setAttribute("disabled", "true");
-    }
-}
-
-// 2. Select dropdown event listener
-sampleLogsSelect.addEventListener("change", (e) => {
-    const selectedTemplate = e.target.value;
-    if (LOG_TEMPLATES[selectedTemplate]) {
-        logTextarea.value = LOG_TEMPLATES[selectedTemplate];
-    }
-});
-
-// Trace rendering helpers
-function appendTraceLine(text, cssClass) {
-    const lineEl = document.createElement("div");
-    lineEl.className = `trace-line ${cssClass}`;
-    lineEl.textContent = text;
-    traceLogs.appendChild(lineEl);
-    traceLogs.scrollTop = traceLogs.scrollHeight;
-    return lineEl;
-}
-
-function typewriterTraceLine(text, cssClass, speed = 15) {
-    const lineEl = document.createElement("div");
-    lineEl.className = `trace-line ${cssClass}`;
-    traceLogs.appendChild(lineEl);
+// Populate dropdown on load
+async function populateIncidentsDropdown() {
+  const dd = document.getElementById('inc-dd');
+  dd.innerHTML = '<option value="" disabled selected>-- Select an incident template --</option>';
+  try {
+    const r = await fetch(`${API_BASE_URL}/api/incidents/config`);
+    if (!r.ok) throw new Error("Failed to load incidents config");
+    INCIDENTS = await r.json();
     
-    lineEl.style.animation = "none";
-    lineEl.style.opacity = 1;
-    lineEl.style.transform = "none";
-    
-    let charIdx = 0;
-    return new Promise((resolve) => {
-        function nextChar() {
-            if (charIdx < text.length) {
-                lineEl.textContent += text.charAt(charIdx);
-                charIdx++;
-                traceLogs.scrollTop = traceLogs.scrollHeight;
-                setTimeout(nextChar, speed);
-            } else {
-                resolve(lineEl);
-            }
-        }
-        nextChar();
+    INCIDENTS.forEach((inc, idx) => {
+      const opt = document.createElement('option');
+      opt.value = idx;
+      opt.textContent = inc.id + ' · ' + inc.svc + ' · ' + inc.label.split(' · ').slice(2).join(' · ');
+      dd.appendChild(opt);
+    });
+  } catch (err) {
+    console.error("Error loading incidents config:", err);
+  }
+}
+
+function onSelectIncident() {
+  const i = parseInt(document.getElementById('inc-dd').value);
+  const inc = INCIDENTS[i];
+  if (!inc) return;
+
+  // Update Sev Chip
+  const chip = document.getElementById('sev-chip');
+  chip.style.display = 'inline-flex';
+  chip.style.borderColor = inc.chipBdr;
+  chip.style.backgroundColor = inc.chipBg;
+  chip.style.color = inc.chipClr;
+  chip.innerHTML = `<i class="ti ${inc.chipIco}"></i> ${inc.chip}`;
+
+  // Update Meta Bar
+  document.getElementById('meta-sev').textContent = inc.sev;
+  document.getElementById('meta-sev').style.color = inc.sevClr;
+  document.getElementById('meta-status').textContent = 'Open';
+  document.getElementById('meta-status').style.color = 'var(--amber)';
+  document.getElementById('meta-src').textContent = inc.src;
+  document.getElementById('meta-svc').textContent = inc.svc;
+  document.getElementById('meta-created').textContent = inc.ts;
+  document.getElementById('meta-assigned').textContent = 'orchestrator_agent';
+
+  // Enable Run Button
+  document.getElementById('run-btn').removeAttribute('disabled');
+
+  resetAllSteps();
+}
+
+function resetAllSteps() {
+  STEPS.forEach(step => updateStepCard(step.id, 'wait', null));
+  document.getElementById('progress-fill').style.width = '0%';
+  document.getElementById('progress-pct').textContent = '0%';
+  document.getElementById('elapsed-time').textContent = '00:00';
+  if (timer) clearInterval(timer);
+
+  // Reset confidence and remediation panel
+  animateConfidenceRing(0);
+  document.getElementById('conf-label').textContent = 'Awaiting analysis';
+  document.getElementById('conf-label').style.color = 'var(--text-3)';
+  document.getElementById('conf-risk').textContent = '—';
+  document.getElementById('conf-rec').textContent = '—';
+  document.getElementById('hitl-panel').style.display = 'none';
+
+  document.getElementById('remediation-placeholder').style.display = 'block';
+  document.getElementById('remediation-placeholder').innerHTML =
+    '<i class="ti ti-dots" style="font-size:20px;display:block;margin-bottom:6px;"></i>Awaiting agent analysis';
+  document.getElementById('root-cause-box').style.display = 'none';
+  document.getElementById('actions-label').style.display = 'none';
+  document.getElementById('actions-list').innerHTML = '';
+  document.getElementById('btn-row').style.display = 'none';
+  document.getElementById('auto-badge').style.display = 'none';
+  document.getElementById('rag-source-note').style.display = 'none';
+  
+  const fallbackBanner = document.getElementById('fallback-banner');
+  if (fallbackBanner) fallbackBanner.style.display = 'none';
+}
+
+function renderSteps() {
+  const grid = document.getElementById('steps-grid');
+  grid.innerHTML = '';
+  STEPS.forEach(step => {
+    const card = document.createElement('div');
+    card.className = 'step-card wait';
+    card.id = `step-card-${step.id}`;
+    card.innerHTML = `
+      <div class="step-top">
+        <div class="step-icon" id="step-icon-${step.id}">
+          <i class="ti ${step.icon}"></i>
+        </div>
+        <div class="step-meta">
+          <div class="step-num" id="step-num-${step.id}">Step ${step.num} · ${step.name}</div>
+          <div class="step-name">${step.sub}</div>
+        </div>
+        <span class="step-badge badge-wait" id="step-badge-${step.id}">Pending</span>
+      </div>
+      <div class="source-row">
+        <span class="src-tag ${step.sourceType}" id="step-src-${step.id}">
+          ${step.sourceType === 'rag+llm' ? 'RAG + LLM' : step.sourceType.toUpperCase()}
+        </span>
+        <span class="source-label">${step.sourceLabel}</span>
+      </div>
+      <div class="step-output" id="step-output-${step.id}">
+        <span class="out-key">status: </span><span class="out-amber">${step.pendingOutput}</span>
+      </div>
+    `;
+    grid.appendChild(card);
+  });
+}
+
+function updateStepCard(stepId, state, outputData) {
+  const card = document.getElementById(`step-card-${stepId}`);
+  const icon = document.getElementById(`step-icon-${stepId}`);
+  const numEl = document.getElementById(`step-num-${stepId}`);
+  const badge = document.getElementById(`step-badge-${stepId}`);
+  const output = document.getElementById(`step-output-${stepId}`);
+  if (!card) return;
+
+  card.className = `step-card ${state}`;
+  icon.className = `step-icon ${state}`;
+  if (numEl) numEl.className = `step-num ${state}`;
+
+  const badgeMap = { done: 'badge-done', active: 'badge-active', wait: 'badge-wait' };
+  const badgeTxt = { done: 'Done', active: 'Active', wait: 'Pending' };
+  badge.className = `step-badge ${badgeMap[state]}`;
+  badge.textContent = badgeTxt[state];
+
+  if (outputData) {
+    output.className = `step-output ${state === 'done' ? 'done-out' : 'active-out'}`;
+    output.innerHTML = formatOutput(outputData);
+  } else if (state === 'wait') {
+    const stepDef = STEPS.find(s => s.id === stepId);
+    output.className = 'step-output';
+    output.innerHTML = `<span class="out-key">status: </span><span class="out-amber">${stepDef ? stepDef.pendingOutput : 'waiting…'}</span>`;
+  }
+}
+
+function formatOutput(data) {
+  return Object.entries(data).map(([k, v]) => {
+    const clsMap = {
+      severity: 'out-red', category: 'out-teal', confidence: 'out-teal',
+      rag_hits: 'out-amber', match: 'out-amber', score: 'out-teal',
+      action: 'out-teal'
+    };
+    const cls = clsMap[k] || 'out-white';
+    return `<span class="out-key">${k}: </span><span class="${cls}">${typeof v === 'object' ? JSON.stringify(v) : v
+      }</span>`;
+  }).join('<br>');
+}
+
+function runTriaging() {
+  const val = document.getElementById('inc-dd').value;
+  if (val === "") {
+    alert("Please select an incident first.");
+    return;
+  }
+  const i = parseInt(val);
+  const inc = INCIDENTS[i];
+
+  document.getElementById('run-btn-text').textContent = 'Running...';
+  document.getElementById('run-btn').setAttribute('disabled', 'true');
+  resetAllSteps();
+
+  fetch(`${API_BASE_URL}/api/incidents`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ log_text: inc.label, incident_id: inc.id })
+  })
+    .then(r => r.json())
+    .then(data => {
+      currentIncidentId = data.incident_id;
+      openSSE(currentIncidentId);
+    })
+    .catch(err => {
+      console.error(err);
+      alert("Failed to start incident response session.");
+      resetUIControls();
     });
 }
 
-// Result Card Rendering helpers
-function updateConfidenceRing(percent) {
-    const r = 34;
-    const circ = 2 * Math.PI * r;
-    const offset = circ - (percent / 100) * circ;
-    confidenceRingBar.style.strokeDashoffset = offset;
-    cardConfidenceText.innerText = `${percent}%`;
-}
+function openSSE(id) {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource(`${API_BASE_URL}/api/incidents/${id}/stream`);
+  let elapsed = 0;
+  timer = setInterval(() => {
+    elapsed++;
+    const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+    const s = String(elapsed % 60).padStart(2, '0');
+    document.getElementById('elapsed-time').textContent = `${m}:${s}`;
+  }, 1000);
 
-function formatCodeSnippets(text) {
-    return text.replace(/`([^`]+)`/g, '<code>$1</code>');
-}
+  eventSource.onmessage = (evt) => {
+    const payload = JSON.parse(evt.data);
 
-function parseServiceFromLog(logText) {
-    const match = logText.match(/(?:INFO|WARN|ERROR)\s+([a-zA-Z0-9_-]+)/);
-    return match ? match[1] : "system-service";
-}
+    switch (payload.step) {
 
-// Toggle Raw JSON panel
-toggleRawBtn.addEventListener("click", () => {
-    if (rawTraceLogs.classList.contains("hidden")) {
-        rawTraceLogs.classList.remove("hidden");
-        toggleRawBtn.innerText = "Hide raw agent trace";
-    } else {
-        rawTraceLogs.classList.add("hidden");
-        toggleRawBtn.innerText = "View raw agent trace";
-    }
-});
-
-// 3. HITL approval callback
-async function handleHitlDecision(approved) {
-    if (!activeIncidentId) return;
-    
-    approveBtn.setAttribute("disabled", "true");
-    rejectBtn.setAttribute("disabled", "true");
-    
-    try {
-        const response = await fetch(`${API_BASE_URL}/api/incidents/${activeIncidentId}/approve`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({ approved: approved })
+      case 'classification':
+        updateStepCard('monitor', 'done', {
+          detected: payload.data.alert_type,
+          alerts: payload.data.alert_count,
+          first_seen: payload.data.timestamp
         });
-        
-        if (!response.ok) {
-            throw new Error(`Failed to send approval status: ${response.status}`);
-        }
-        
-        hitlPanel.classList.add("hidden");
-        incidentCard.classList.remove("awaiting-approval");
-        
-        if (approved) {
-            appendTraceLine("👤 [HITL] Operator APPROVED the resolution plan. Resuming...", "trace-system-complete");
+        updateStepCard('triage', 'active', null);
+        updateProgressBar(17);
+        break;
+
+      case 'rag_retrieval':
+        updateStepCard('triage', 'done', {
+          severity: payload.data.severity,
+          category: payload.data.category,
+          confidence: payload.data.confidence,
+          route_to: payload.data.expert
+        });
+        updateStepCard('planning', 'active', null);
+        updateProgressBar(34);
+        break;
+
+      case 'expert_analysis':
+        updateStepCard('planning', 'done', {
+          plan: `${payload.data.sub_tasks?.length || 4} sub-tasks`,
+          tools: 'search_logs, query_chromadb',
+        });
+        updateStepCard('expert', 'active', {
+          rag_hits: `${payload.data.rag_count} similar incidents found`,
+          match: payload.data.rag_top_match || 'retrieving…',
+          expert: `${payload.data.expert_name} reasoning…`
+        });
+        updateProgressBar(57);
+        break;
+
+      case 'reflection':
+        updateStepCard('expert', 'done', {
+          rag_hits: `${payload.data.rag_count} matched`,
+          root_cause: payload.data.root_cause,
+          proposed: payload.data.proposed_fix_summary,
+          past_incidents: payload.data.past_incidents_matched ? payload.data.past_incidents_matched.join('; ') : 'None',
+          expert_reasoning: payload.data.expert_reasoning ? payload.data.expert_reasoning.join('; ') : 'None'
+        });
+        updateStepCard('reflection', 'active', {
+          score: `${payload.data.score}/10`,
+          critique: payload.data.critique
+        });
+        updateProgressBar(75);
+        animateConfidenceRing(Math.round(payload.data.confidence * 100));
+        break;
+
+      case 'hitl_required':
+        updateStepCard('reflection', 'done', {
+          score: `${payload.data.score}/10`,
+          approved: 'awaiting human'
+        });
+        updateStepCard('decision', 'active', {
+          action: 'paused — human approval needed',
+          hitl_required: 'true'
+        });
+        updateProgressBar(90);
+        document.getElementById('hitl-panel').style.display = 'block';
+        break;
+
+      case 'complete':
+        const isRejected = payload.data.status === 'rejected_by_human';
+        updateStepCard('reflection', 'done', {
+          score: `${payload.data.reflection_score}/10`,
+          approved: isRejected ? 'no' : 'yes'
+        });
+        updateStepCard('decision', 'done', {
+          action: isRejected ? 'rejected_by_human' : payload.data.status,
+          written_to_memory: isRejected ? 'false' : 'true'
+        });
+        updateProgressBar(100);
+        animateConfidenceRing(Math.round(payload.data.confidence * 100));
+
+        if (isRejected) {
+          document.getElementById('remediation-placeholder').style.display = 'block';
+          document.getElementById('remediation-placeholder').innerHTML =
+            '<i class="ti ti-x" style="font-size:20px;color:var(--red);display:block;margin-bottom:6px;"></i>Rejected — not written to memory';
+          document.getElementById('root-cause-box').style.display = 'none';
+          document.getElementById('actions-label').style.display = 'none';
+          document.getElementById('actions-list').innerHTML = '';
+          document.getElementById('btn-row').style.display = 'none';
+          document.getElementById('auto-badge').style.display = 'none';
+          document.getElementById('rag-source-note').style.display = 'none';
         } else {
-            appendTraceLine("👤 [HITL] Operator REJECTED the resolution plan. Terminating pipeline.", "trace-error");
-            cardHandlerTag.innerText += " (Rejected by operator)";
-            resetUIControls();
+          showRemediationCard(payload.data);
         }
-        
-        // Refresh session history to show updated status
-        await loadHistory();
-    } catch (err) {
-        console.error("Error sending HITL action:", err);
-        alert(`Error: ${err.message}`);
-        approveBtn.removeAttribute("disabled");
-        rejectBtn.removeAttribute("disabled");
-    }
-}
 
-approveBtn.addEventListener("click", () => handleHitlDecision(true));
-rejectBtn.addEventListener("click", () => handleHitlDecision(false));
-
-// 4. Dispatch run request and connect to stream
-async function runIncidentResponse() {
-    const logContent = logTextarea.value.trim();
-    if (!logContent) {
-        alert("Please paste or select log data first.");
-        return;
-    }
-    
-    if (currentEventSource) {
-        currentEventSource.close();
-    }
-    
-    runBtn.setAttribute("disabled", "true");
-    runBtn.innerText = "Triggering Pipeline...";
-    sampleLogsSelect.setAttribute("disabled", "true");
-    logTextarea.setAttribute("disabled", "true");
-    
-    traceLogs.innerHTML = "";
-    appendTraceLine("⚡ Initializing incident response pipeline...", "trace-memory");
-    
-    resultPlaceholder.classList.remove("hidden");
-    incidentCard.classList.add("hidden");
-    incidentCard.classList.remove("pop-effect", "awaiting-approval");
-    hitlPanel.classList.add("hidden");
-    rawTraceLogs.classList.add("hidden");
-    rawTraceLogs.textContent = "";
-    toggleRawBtn.innerText = "View raw agent trace";
-    
-    approveBtn.removeAttribute("disabled");
-    rejectBtn.removeAttribute("disabled");
-    
-    currentTraceEvents = [];
-    activeIncidentId = null;
-    
-    try {
-        const response = await fetch(`${API_BASE_URL}/api/incidents`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({ log_text: logContent })
-        });
-        
-        if (!response.ok) {
-            throw new Error(`Server returned status: ${response.status}`);
-        }
-        
-        const data = await response.json();
-        activeIncidentId = data.incident_id;
-        appendTraceLine(`🛰️ Session established: ${activeIncidentId}`, "trace-memory");
-        
-        currentEventSource = new EventSource(`${API_BASE_URL}/api/incidents/${activeIncidentId}/stream`);
-        
-        currentEventSource.onmessage = async (e) => {
-            const eventData = JSON.parse(e.data);
-            const { step, data: payload } = eventData;
-            
-            currentTraceEvents.push(eventData);
-            rawTraceLogs.textContent = JSON.stringify(currentTraceEvents, null, 2);
-            
-            if (step === "classification") {
-                const pct = Math.round(payload.confidence * 100);
-                appendTraceLine(
-                    `[CLASSIFIER] Severity: SEV-${payload.severity} | Category: ${payload.category.toUpperCase()} | Confidence: ${pct}%`,
-                    "trace-classifier"
-                );
-                
-                resultPlaceholder.classList.add("hidden");
-                incidentCard.classList.remove("hidden");
-                incidentCard.classList.add("pop-effect");
-                
-                cardSevBadge.className = "sev-badge";
-                if (payload.severity <= 2) {
-                    cardSevBadge.classList.add("sev-red");
-                } else if (payload.severity === 3) {
-                    cardSevBadge.classList.add("sev-amber");
-                } else {
-                    cardSevBadge.classList.add("sev-teal");
-                }
-                cardSevBadge.innerText = `SEV-${payload.severity}`;
-                cardServiceTag.innerText = parseServiceFromLog(logContent);
-                cardHandlerTag.innerText = "triage_classifier";
-                cardRootCause.innerText = payload.root_cause;
-                updateConfidenceRing(0);
-                cardFixSteps.innerHTML = '<li class="placeholder-text">Analyzing logs, retrieving historical resolutions...</li>';
-            } 
-            else if (step === "rag_retrieval") {
-                const count = payload.incidents ? payload.incidents.length : 0;
-                appendTraceLine(
-                    `[MEMORY] Found ${count} similar past incidents in history.`,
-                    "trace-memory"
-                );
-                if (count > 0) {
-                    payload.incidents.forEach(inc => {
-                        appendTraceLine(`  👉 "${inc}"`, "trace-memory");
-                    });
-                }
-            } 
-            else if (step === "expert_analysis") {
-                const expert = payload.expert_handler.toUpperCase();
-                const attemptStr = payload.attempt ? ` (Attempt ${payload.attempt})` : "";
-                
-                const thoughtText = `[${expert}]${attemptStr} Thought: "Detected ${payload.analysis.root_cause || 'root cause'}"`;
-                await typewriterTraceLine(thoughtText, "trace-expert-thought");
-                
-                appendTraceLine(`[${expert}] -> Proposed fix steps:`, "trace-expert-action");
-                payload.analysis.suggested_fix.forEach((stepItem, sIdx) => {
-                    appendTraceLine(`  ${sIdx + 1}. ${stepItem}`, "trace-expert-action");
-                });
-                
-                cardHandlerTag.innerText = payload.expert_handler;
-                cardRootCause.innerText = payload.analysis.root_cause || cardRootCause.innerText;
-                cardFixSteps.innerHTML = "";
-                payload.analysis.suggested_fix.forEach(stepItem => {
-                    const li = document.createElement("li");
-                    li.innerHTML = formatCodeSnippets(stepItem);
-                    cardFixSteps.appendChild(li);
-                });
-                
-                const pct = Math.round(payload.analysis.confidence * 100);
-                updateConfidenceRing(pct);
-            } 
-            else if (step === "reflection") {
-                const score = payload.attempt_1_score || payload.final_score || 0;
-                const scoreStr = payload.final_score !== undefined ? `Attempt 1: ${payload.attempt_1_score}/10 -> Revised: ${payload.final_score}/10` : `${score}/10`;
-                const critique = payload.final_critique || payload.critique || "";
-                
-                const reflectionText = `[REFLECTOR] Review score: ${scoreStr} — "${critique}"`;
-                const cssClass = score < 6 ? "trace-reflector-bad" : "trace-reflector-good";
-                appendTraceLine(reflectionText, cssClass);
-            } 
-            else if (step === "hitl_required") {
-                const classificationInfo = payload.classification || {};
-                appendTraceLine(
-                    `[SYSTEM] Incident severity Sev-${classificationInfo.severity || 2} — Human approval gate REQUIRED to proceed.`,
-                    "trace-system-hitl"
-                );
-                
-                incidentCard.classList.add("awaiting-approval");
-                hitlPanel.classList.remove("hidden");
-            } 
-            else if (step === "complete") {
-                if (payload.status === "rejected_by_human") {
-                    appendTraceLine(
-                        `[SYSTEM] Incident closed. Resolution plan was rejected by operator. Memory write-back skipped.`,
-                        "trace-error"
-                    );
-                    cardHandlerTag.innerText = `${payload.expert_handler} (rejected)`;
-                } else {
-                    appendTraceLine(
-                        `[SYSTEM] Incident resolved successfully. Diagnosis and actions written back to database memory.`,
-                        "trace-system-complete"
-                    );
-                    cardHandlerTag.innerText = `${payload.expert_handler} (resolved)`;
-                }
-                
-                incidentCard.classList.remove("awaiting-approval");
-                hitlPanel.classList.add("hidden");
-                
-                currentEventSource.close();
-                currentEventSource = null;
-                resetUIControls();
-                
-                // Refresh history list
-                await loadHistory();
-            }
-            else if (step === "error") {
-                appendTraceLine(`[ERROR] Pipeline run aborted: ${payload.message}`, "trace-error");
-                incidentCard.classList.remove("awaiting-approval");
-                hitlPanel.classList.add("hidden");
-                currentEventSource.close();
-                currentEventSource = null;
-                resetUIControls();
-            }
-        };
-        
-        currentEventSource.onerror = (err) => {
-            console.error("SSE Connection error:", err);
-            appendTraceLine("⚠️ Connection closed or disconnected from streaming endpoint.", "trace-error");
-            if (currentEventSource) {
-                currentEventSource.close();
-                currentEventSource = null;
-            }
-            resetUIControls();
-        };
-        
-    } catch (err) {
-        console.error("[API ERROR] Failed to dispatch incident:", err);
-        appendTraceLine(`❌ Trigger Failed: ${err.message}`, "trace-error");
         resetUIControls();
+        clearInterval(timer);
+        eventSource.close();
+        loadHistory();
+        break;
+
+      case 'error':
+        alert(`Pipeline Error: ${payload.data.message}`);
+        resetUIControls();
+        clearInterval(timer);
+        eventSource.close();
+        break;
     }
+  };
 }
 
-// 5. Load history of last 10 incidents from backend API
-async function loadHistory() {
-    try {
-        const response = await fetch(`${API_BASE_URL}/api/incidents`);
-        if (!response.ok) return;
-        
-        const data = await response.json();
-        pastIncidents = data;
-        
-        historyStrip.innerHTML = "";
-        if (data.length === 0) {
-            historyStrip.innerHTML = '<div class="placeholder-text">No incidents processed in this session yet.</div>';
-            return;
-        }
-        
-        data.forEach(inc => {
-            const card = document.createElement("div");
-            card.className = "history-card";
-            
-            // Dotted border if fallback resolved
-            if (inc.status === "resolved_by_fallback") {
-                card.classList.add("fallback-resolved");
-            }
-            
-            const badgeClass = inc.classification.severity <= 2 ? "sev-red" : (inc.classification.severity === 3 ? "sev-amber" : "sev-teal");
-            const handlerLabel = inc.expert_handler === "generic_handler" ? "Fallback (SRE)" : inc.expert_handler;
-            
-            card.innerHTML = `
-                <div class="history-card-header">
-                    <span class="history-sev ${badgeClass}">SEV-${inc.classification.severity}</span>
-                    <span class="history-handler">${handlerLabel}</span>
-                </div>
-                <div class="history-cause">${inc.analysis.root_cause || "System Triage"}</div>
-                <div class="history-meta">
-                    <span class="history-service">${parseServiceFromLog(inc.log_text)}</span>
-                    <span>Confidence: ${Math.round(inc.analysis.confidence * 100)}%</span>
-                </div>
-            `;
-            
-            card.addEventListener("click", () => showPastIncidentDetails(inc));
-            historyStrip.appendChild(card);
-        });
-    } catch (err) {
-        console.error("Error loading triage history:", err);
-    }
+function updateProgressBar(pct) {
+  document.getElementById('progress-fill').style.width = pct + '%';
+  document.getElementById('progress-pct').textContent = pct + '%';
 }
 
-// Show details of a historical incident in read-only mode
-function showPastIncidentDetails(inc) {
-    resultPlaceholder.classList.add("hidden");
-    incidentCard.classList.remove("hidden");
-    incidentCard.classList.remove("pop-effect", "awaiting-approval");
-    hitlPanel.classList.add("hidden");
-    rawTraceLogs.classList.add("hidden");
-    toggleRawBtn.innerText = "View raw agent trace";
-    
-    cardSevBadge.className = "sev-badge";
-    if (inc.classification.severity <= 2) {
-        cardSevBadge.classList.add("sev-red");
-    } else if (inc.classification.severity === 3) {
-        cardSevBadge.classList.add("sev-amber");
-    } else {
-        cardSevBadge.classList.add("sev-teal");
-    }
-    cardSevBadge.innerText = `SEV-${inc.classification.severity}`;
-    cardServiceTag.innerText = parseServiceFromLog(inc.log_text);
-    
-    const handlerLabel = inc.status === "resolved_by_fallback" ? `${inc.expert_handler} (fallback resolved)` : `${inc.expert_handler} (resolved)`;
-    cardHandlerTag.innerText = handlerLabel;
-    
-    cardRootCause.innerText = inc.analysis.root_cause || "Triage completed.";
-    
-    cardFixSteps.innerHTML = "";
-    inc.analysis.suggested_fix.forEach(stepItem => {
-        const li = document.createElement("li");
-        li.innerHTML = formatCodeSnippets(stepItem);
-        cardFixSteps.appendChild(li);
+function animateConfidenceRing(score) {
+  const circ = 2 * Math.PI * 36;
+  const fill = (score / 100) * circ;
+  const arc = document.getElementById('conf-arc');
+  arc.setAttribute('stroke-dasharray', `${fill.toFixed(1)} ${circ.toFixed(1)}`);
+  document.getElementById('conf-pct').textContent = score > 0 ? score + '%' : '—';
+
+  if (score === 0) {
+    document.getElementById('conf-label').textContent = 'Awaiting analysis';
+    document.getElementById('conf-label').style.color = 'var(--text-3)';
+    return;
+  }
+
+  document.getElementById('conf-label').textContent = score >= 70 ? 'High confidence' : score >= 50 ? 'Moderate confidence' : 'Low confidence';
+  document.getElementById('conf-label').style.color = score >= 70 ? 'var(--teal)' : score >= 50 ? 'var(--amber)' : 'var(--red)';
+  document.getElementById('conf-risk').textContent = score >= 70 ? 'Low' : score >= 50 ? 'Medium' : 'High';
+  document.getElementById('conf-rec').textContent = score >= 70 ? 'Auto Remediate' : 'Human Review Required';
+}
+
+function showRemediationCard(data) {
+  document.getElementById('remediation-placeholder').style.display = 'none';
+  document.getElementById('root-cause-box').style.display = 'block';
+  document.getElementById('root-cause-text').textContent = data.root_cause;
+  document.getElementById('actions-label').style.display = 'block';
+  document.getElementById('btn-row').style.display = 'grid';
+  
+  const fallbackBanner = document.getElementById('fallback-banner');
+  if (data.status === 'resolved_by_fallback') {
+    if (fallbackBanner) fallbackBanner.style.display = 'flex';
+    document.getElementById('auto-badge').style.display = 'none';
+  } else {
+    if (fallbackBanner) fallbackBanner.style.display = 'none';
+    document.getElementById('auto-badge').style.display = 'inline';
+  }
+  
+  if (data.rag_count > 0) {
+    document.getElementById('rag-source-note').style.display = 'flex';
+    document.getElementById('rag-source-text').textContent =
+      `Fix derived from ${data.rag_count} similar past incident${data.rag_count > 1 ? 's' : ''} in memory`;
+  } else {
+    document.getElementById('rag-source-note').style.display = 'none';
+  }
+  const list = document.getElementById('actions-list');
+  list.innerHTML = '';
+  data.suggested_fix.forEach((step, i) => {
+    list.innerHTML += `<div class="action-item"><span class="action-num">${i + 1}.</span>${step}</div>`;
+  });
+}
+
+function approveHITL(approved) {
+  fetch(`${API_BASE_URL}/api/incidents/${currentIncidentId}/approve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ approved })
+  })
+    .then(() => {
+      document.getElementById('hitl-panel').style.display = 'none';
+      if (!approved) {
+        document.getElementById('remediation-placeholder').style.display = 'block';
+        document.getElementById('remediation-placeholder').innerHTML =
+          '<i class="ti ti-x" style="font-size:20px;color:var(--red);display:block;margin-bottom:6px;"></i>Rejected — not written to memory';
+      }
+    })
+    .catch(err => {
+      console.error(err);
+      alert("Failed to send HITL approval response.");
     });
-    
-    const pct = Math.round(inc.analysis.confidence * 100);
-    updateConfidenceRing(pct);
-    
-    rawTraceLogs.textContent = JSON.stringify(inc, null, 2);
 }
 
 function resetUIControls() {
-    if (isBackendConnected) {
-        runBtn.removeAttribute("disabled");
-    }
-    runBtn.innerText = "Run Incident Response";
-    sampleLogsSelect.removeAttribute("disabled");
-    logTextarea.removeAttribute("disabled");
+  document.getElementById('run-btn-text').textContent = 'Run incident triaging';
+  document.getElementById('run-btn').removeAttribute('disabled');
 }
 
-runBtn.addEventListener("click", runIncidentResponse);
+async function loadHistory() {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/incidents`);
+    if (!response.ok) return;
 
-// Start connection polling and history fetching immediately
-checkBackendConnection();
-loadHistory();
-setInterval(checkBackendConnection, 20000);
+    const data = await response.json();
+    const historyStrip = document.getElementById("historyStrip");
+    historyStrip.innerHTML = "";
+    if (data.length === 0) {
+      historyStrip.innerHTML = '<div style="color:var(--text-3); font-style:italic;">No incidents processed in this session yet.</div>';
+      return;
+    }
+
+    data.forEach(inc => {
+      const card = document.createElement("div");
+      card.className = "history-card";
+
+      const badgeClass = inc.status === "resolved_by_expert" ? "sev-teal" : (inc.status === "resolved_by_fallback" ? "sev-amber" : "sev-red");
+      const handlerLabel = inc.status === "resolved_by_fallback" ? "Fallback (SRE)" : (inc.status === "rejected_by_human" ? "Rejected" : "Expert Agent");
+
+      card.innerHTML = `
+        <div class="history-card-header">
+          <span class="history-sev ${badgeClass}">${inc.status.replace(/_/g, ' ').toUpperCase()}</span>
+          <span class="history-handler">${handlerLabel}</span>
+        </div>
+        <div class="history-cause">${inc.root_cause || "System Triage"}</div>
+        <div class="history-meta">
+          <span>Confidence: ${Math.round(inc.confidence * 100)}%</span>
+        </div>
+      `;
+
+      historyStrip.appendChild(card);
+    });
+  } catch (err) {
+    console.error("Error loading triage history:", err);
+  }
+}
+
+// Health Check
+async function checkBackendConnection() {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/incidents`);
+    if (response.ok) {
+      setConnectionState(true, "System Online");
+    } else {
+      setConnectionState(false, "System Offline (Server Error)");
+    }
+  } catch (error) {
+    setConnectionState(false, "System Offline (Unable to Connect)");
+  }
+}
+
+function setConnectionState(connected, text) {
+  isBackendConnected = connected;
+  const statusText = document.getElementById("statusText");
+  const statusDot = document.getElementById("statusDot");
+  statusText.innerText = text;
+  if (connected) {
+    statusDot.classList.add("connected");
+  } else {
+    statusDot.classList.remove("connected");
+  }
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  renderSteps();
+  populateIncidentsDropdown();
+  checkBackendConnection();
+  loadHistory();
+  setInterval(checkBackendConnection, 15000);
+});

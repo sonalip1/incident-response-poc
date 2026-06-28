@@ -84,7 +84,7 @@ async def create_incident(req: IncidentRequest, background_tasks: BackgroundTask
     if not req.log_text.strip():
         raise HTTPException(status_code=400, detail="Log text cannot be empty.")
         
-    incident_id = str(uuid.uuid4())
+    incident_id = req.incident_id or str(uuid.uuid4())
     active_logs[incident_id] = req.log_text
     
     # Start the async orchestrator task in the background
@@ -137,3 +137,16 @@ async def get_incidents_history():
     Returns the last 10 completed incidents.
     """
     return history
+
+@app.get("/api/incidents/config")
+async def get_incidents_config():
+    """
+    Returns the parsed incident templates from data/incidents_config.json.
+    """
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "incidents_config.json")
+    try:
+        with open(config_path, "r") as f:
+            data = json.load(f)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load incidents config: {str(e)}")
